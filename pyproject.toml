@@ -1,0 +1,11 @@
+[project]
+name = "gapi-mcp"
+version = "1.0.0"
+description = "Lean Google Calendar + Tasks MCP server"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp[cli]",
+    "google-api-python-client",
+    "google-auth",
+    "google-auth-oauthlib",
+]
