@@ -382,6 +382,55 @@ def list_task_lists() -> str:
 
 @mcp.tool()
 @_api_error_handler
+def get_task_list(task_list_id: str) -> str:
+    """Get details of a specific task list.
+
+    Args:
+        task_list_id: The task list ID
+    """
+    tl = _tasks().tasklists().get(tasklist=task_list_id).execute()
+    return f"Title: {tl.get('title', '?')}\nID: {tl.get('id', '?')}\nUpdated: {tl.get('updated', '?')}"
+
+
+@mcp.tool()
+@_api_error_handler
+def create_task_list(title: str) -> str:
+    """Create a new task list.
+
+    Args:
+        title: Title for the new task list
+    """
+    tl = _tasks().tasklists().insert(body={"title": title}).execute()
+    return f"Task list created: {tl.get('title')}\nID: {tl.get('id')}"
+
+
+@mcp.tool()
+@_api_error_handler
+def update_task_list(task_list_id: str, title: str) -> str:
+    """Rename a task list.
+
+    Args:
+        task_list_id: The task list ID to update
+        title: New title
+    """
+    tl = _tasks().tasklists().update(tasklist=task_list_id, body={"id": task_list_id, "title": title}).execute()
+    return f"Task list updated: {tl.get('title')}"
+
+
+@mcp.tool()
+@_api_error_handler
+def delete_task_list(task_list_id: str) -> str:
+    """Delete a task list and all its tasks.
+
+    Args:
+        task_list_id: The task list ID to delete
+    """
+    _tasks().tasklists().delete(tasklist=task_list_id).execute()
+    return f"Task list {task_list_id} deleted."
+
+
+@mcp.tool()
+@_api_error_handler
 def list_tasks(
     task_list_id: str,
     max_results: int = 100,
@@ -527,6 +576,62 @@ def delete_task(task_list_id: str, task_id: str) -> str:
     """
     _tasks().tasks().delete(tasklist=task_list_id, task=task_id).execute()
     return f"Task {task_id} deleted."
+
+
+@mcp.tool()
+@_api_error_handler
+def move_task(
+    task_list_id: str,
+    task_id: str,
+    parent: str | None = None,
+    previous: str | None = None,
+    destination_task_list: str | None = None,
+) -> str:
+    """Move a task to a different position, parent, or task list.
+
+    Args:
+        task_list_id: Current task list ID
+        task_id: The task ID to move
+        parent: New parent task ID (makes it a subtask)
+        previous: Previous sibling task ID (for ordering)
+        destination_task_list: Destination task list ID (for moving between lists)
+    """
+    svc = _tasks()
+
+    if destination_task_list and destination_task_list != task_list_id:
+        # Cross-list move: get task, create in destination, delete from source
+        t = svc.tasks().get(tasklist=task_list_id, task=task_id).execute()
+        body: dict[str, Any] = {"title": t.get("title", ""), "notes": t.get("notes"), "due": t.get("due"), "status": t.get("status")}
+        body = {k: v for k, v in body.items() if v is not None}
+        kwargs: dict[str, Any] = dict(tasklist=destination_task_list, body=body)
+        if parent:
+            kwargs["parent"] = parent
+        if previous:
+            kwargs["previous"] = previous
+        new_t = svc.tasks().insert(**kwargs).execute()
+        svc.tasks().delete(tasklist=task_list_id, task=task_id).execute()
+        return f"Task moved to list {destination_task_list}\nNew ID: {new_t.get('id')}"
+
+    # Same-list move
+    kwargs = dict(tasklist=task_list_id, task=task_id)
+    if parent:
+        kwargs["parent"] = parent
+    if previous:
+        kwargs["previous"] = previous
+    t = svc.tasks().move(**kwargs).execute()
+    return f"Task moved: {t.get('title')}\nID: {t.get('id')}"
+
+
+@mcp.tool()
+@_api_error_handler
+def clear_completed_tasks(task_list_id: str) -> str:
+    """Clear all completed tasks from a task list (marks them as hidden).
+
+    Args:
+        task_list_id: The task list ID to clear completed tasks from
+    """
+    _tasks().tasks().clear(tasklist=task_list_id).execute()
+    return f"Completed tasks cleared from list {task_list_id}."
 
 
 # ── Entry Point ──────────────────────────────────────────────────────────────
