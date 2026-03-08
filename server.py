@@ -1,12 +1,16 @@
-"""Lean Google Calendar + Tasks MCP server. 12 tools, single file."""
+"""Lean Google Calendar + Tasks MCP server. 13 tools, single file."""
 
 from __future__ import annotations
 
 import json
 import functools
+import subprocess
+import threading
 from datetime import datetime, timezone as _tz
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse, parse_qs
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -25,8 +29,114 @@ SCOPES = [
     "https://www.googleapis.com/auth/calendar.events",
     "https://www.googleapis.com/auth/tasks",
 ]
+REAUTH_PORT = 18085  # Obscure port for persistent callback listener
 
 mcp = FastMCP("gapi")
+
+# ── Persistent OAuth callback listener ───────────────────────────────────────
+
+# Shared state between the callback listener and the reauth tool.
+_reauth_flow: InstalledAppFlow | None = None  # Set when reauth is initiated
+_reauth_lock = threading.Lock()
+
+_PAGE_STYLE = """
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    background: #0d0d0d; color: #e0e0e0;
+  }
+  .card {
+    text-align: center; padding: 3rem 2.5rem; border-radius: 1rem;
+    background: #1a1a1a; border: 1px solid #2a2a2a;
+    box-shadow: 0 8px 32px rgba(0,0,0,.4);
+    max-width: 420px; width: 90%;
+  }
+  .icon { font-size: 3rem; margin-bottom: 1rem; }
+  h1 { font-size: 1.4rem; font-weight: 600; margin-bottom: .5rem; }
+  p { font-size: .95rem; color: #888; line-height: 1.5; }
+  .success h1 { color: #a8e6a3; }
+  .error h1 { color: #e6a3a3; }
+  .idle h1 { color: #a3c4e6; }
+  .subtle { margin-top: 1.2rem; font-size: .8rem; color: #555; }
+</style>
+"""
+
+_PAGE_SUCCESS = f"""<!DOCTYPE html><html><head><title>gapi-mcp</title>{_PAGE_STYLE}</head>
+<body><div class="card success">
+  <div class="icon">&#10003;</div>
+  <h1>authenticated</h1>
+  <p>credentials saved. you can close this tab.</p>
+  <p class="subtle">gapi-mcp &middot; oauth callback</p>
+</div></body></html>"""
+
+_PAGE_IDLE = f"""<!DOCTYPE html><html><head><title>gapi-mcp</title>{_PAGE_STYLE}</head>
+<body><div class="card idle">
+  <div class="icon">&#9679;</div>
+  <h1>listening</h1>
+  <p>no active reauth flow. call the reauth tool first.</p>
+  <p class="subtle">gapi-mcp &middot; oauth callback</p>
+</div></body></html>"""
+
+_PAGE_ERROR = f"""<!DOCTYPE html><html><head><title>gapi-mcp</title>{_PAGE_STYLE}</head>
+<body><div class="card error">
+  <div class="icon">&#10007;</div>
+  <h1>auth failed</h1>
+  <p>{{error}}</p>
+  <p class="subtle">gapi-mcp &middot; oauth callback</p>
+</div></body></html>"""
+
+
+class _OAuthCallbackHandler(BaseHTTPRequestHandler):
+    """Handles Google's OAuth redirect on the persistent listener."""
+
+    def do_GET(self):
+        global _reauth_flow
+        parsed = urlparse(self.path)
+        params = parse_qs(parsed.query)
+
+        with _reauth_lock:
+            flow = _reauth_flow
+
+        if flow is None or "code" not in params:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(_PAGE_IDLE.encode())
+            return
+
+        # We have an active flow and a code — complete the exchange
+        try:
+            auth_response = f"https://localhost:{REAUTH_PORT}{self.path}"
+            flow.fetch_token(authorization_response=auth_response)
+            _save_creds(flow.credentials)
+
+            with _reauth_lock:
+                _reauth_flow = None
+
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(_PAGE_SUCCESS.encode())
+        except Exception as e:
+            self.send_response(500)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(_PAGE_ERROR.replace("{error}", str(e)).encode())
+
+    def log_message(self, format, *args):
+        pass  # Suppress request logging to stderr (would pollute MCP stdio)
+
+
+def _start_callback_listener():
+    """Start the persistent OAuth callback HTTP server in a daemon thread."""
+    server = HTTPServer(("localhost", REAUTH_PORT), _OAuthCallbackHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+
+_start_callback_listener()
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
 
@@ -46,8 +156,13 @@ def _save_creds(creds: Credentials) -> None:
     CREDS_PATH.write_text(json.dumps(data, indent=2))
 
 
+class ReauthRequired(Exception):
+    """Raised when credentials are expired/revoked and need browser reauth."""
+    pass
+
+
 def _load_creds() -> Credentials:
-    """Load credentials from disk, refresh if expired, or run OAuth flow."""
+    """Load credentials from disk, refresh if expired. Raises ReauthRequired on failure."""
     creds = None
 
     if CREDS_PATH.exists():
@@ -62,15 +177,19 @@ def _load_creds() -> Credentials:
         )
 
     if creds and creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-        _save_creds(creds)
+        try:
+            creds.refresh(Request())
+            _save_creds(creds)
+        except Exception:
+            # Refresh failed (revoked, expired grant, etc.) — need full reauth
+            raise ReauthRequired(
+                "Token refresh failed. Call the 'reauth' tool to get a link to re-authorize."
+            )
 
     if not creds or not creds.valid:
-        if not CLIENT_SECRET.exists():
-            raise RuntimeError(f"No credentials and no client_secret.json at {CLIENT_SECRET}")
-        flow = InstalledAppFlow.from_client_secrets_file(str(CLIENT_SECRET), SCOPES)
-        creds = flow.run_local_server(port=0)
-        _save_creds(creds)
+        raise ReauthRequired(
+            "No valid credentials. Call the 'reauth' tool to get a link to authorize."
+        )
 
     return creds
 
@@ -92,9 +211,28 @@ def _api_error_handler(func):
     def wrapper(*args, **kwargs):
         try:
             return func(*args, **kwargs)
+        except ReauthRequired:
+            return (
+                "REAUTH REQUIRED: Google credentials are expired or revoked. "
+                "Call the 'reauth' tool — it will return a URL for the user to "
+                "open in their browser to re-authorize."
+            )
         except HttpError as e:
-            return f"Google API error {e.resp.status}: {e._get_reason()}"
+            reason = e._get_reason()
+            if "invalid_grant" in str(e) or "Token has been" in reason:
+                return (
+                    "REAUTH REQUIRED: Google credentials are expired or revoked. "
+                    "Call the 'reauth' tool — it will return a URL for the user to "
+                    "open in their browser to re-authorize."
+                )
+            return f"Google API error {e.resp.status}: {reason}"
         except Exception as e:
+            if "invalid_grant" in str(e):
+                return (
+                    "REAUTH REQUIRED: Google credentials are expired or revoked. "
+                    "Call the 'reauth' tool — it will return a URL for the user to "
+                    "open in their browser to re-authorize."
+                )
             return f"Error: {e}"
     return wrapper
 
@@ -131,6 +269,52 @@ def _fmt_task(t: dict) -> str:
         preview = notes[:200] + "..." if len(notes) > 200 else notes
         parts.append(f"  Notes: {preview}")
     return "\n".join(parts)
+
+
+# ── Reauth Tool ──────────────────────────────────────────────────────────────
+
+
+@mcp.tool()
+def reauth() -> str:
+    """Start Google OAuth re-authorization flow. Returns a URL for the user to open.
+
+    Use this when other tools return REAUTH REQUIRED errors. The flow listens on
+    a fixed port so the URL is always http://localhost:18085. Tell the user to open
+    it in their browser and authorize. The tool blocks until authorization completes
+    or times out after 120 seconds.
+    """
+    # NOTE: Despite the docstring, this tool now returns immediately after opening
+    # the browser. A persistent listener on port 18085 handles the callback.
+    # The docstring is kept for MCP tool description compatibility.
+    global _reauth_flow
+
+    try:
+        # Remove stale credentials
+        if CREDS_PATH.exists():
+            CREDS_PATH.unlink()
+
+        if not CLIENT_SECRET.exists():
+            return f"ERROR: No client_secret.json found at {CLIENT_SECRET}. Cannot reauthorize."
+
+        flow = InstalledAppFlow.from_client_secrets_file(str(CLIENT_SECRET), SCOPES)
+        flow.redirect_uri = f"http://localhost:{REAUTH_PORT}/"
+        auth_url, _ = flow.authorization_url(access_type="offline")
+
+        # Store the flow so the persistent callback handler can complete it
+        with _reauth_lock:
+            _reauth_flow = flow
+
+        # Open the auth URL in the user's browser
+        subprocess.Popen(["xdg-open", auth_url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        return (
+            f"Browser opened for Google authorization.\n\n"
+            f"If the browser didn't open, use this URL:\n{auth_url}\n\n"
+            f"After authorizing, try any Google tool again to confirm it worked."
+        )
+
+    except Exception as e:
+        return f"Reauth failed: {e}"
 
 
 # ── Calendar Tools ───────────────────────────────────────────────────────────
